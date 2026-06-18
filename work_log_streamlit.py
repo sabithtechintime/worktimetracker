@@ -1,6 +1,7 @@
 import json
 import os
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -8,6 +9,7 @@ import streamlit as st
 LOG_FILE = "daily_work_log.json"
 TARGET_HOURS = 8
 HALF_DAY_MINIMUM_HOURS = 6
+APP_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
 
 # -----------------------------
@@ -15,15 +17,15 @@ HALF_DAY_MINIMUM_HOURS = 6
 # -----------------------------
 
 def now():
-    return datetime.now()
+    return datetime.now(APP_TIMEZONE)
 
 
 def today_key():
-    return date.today().isoformat()
+    return now().date().isoformat()
 
 
 def current_month_key():
-    return date.today().strftime("%Y-%m")
+    return now().date().strftime("%Y-%m")
 
 
 def target_duration():
@@ -66,11 +68,18 @@ def get_today_log(data):
 
 
 def parse_datetime(value):
-    return datetime.fromisoformat(value)
+    parsed = datetime.fromisoformat(value)
+
+    # Old saved records may not have timezone info.
+    # Treat old naive records as Asia/Kolkata time.
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=APP_TIMEZONE)
+
+    return parsed.astimezone(APP_TIMEZONE)
 
 
 def format_time(value):
-    return value.strftime("%I:%M:%S %p")
+    return value.astimezone(APP_TIMEZONE).strftime("%I:%M:%S %p")
 
 
 def format_duration(duration):
@@ -557,16 +566,30 @@ def show_flash():
         st.info(message)
 
 
+def get_app_passcode():
+    env_passcode = os.environ.get("WORKLOG_PASSCODE", "")
+
+    try:
+        secrets_passcode = st.secrets.get("WORKLOG_PASSCODE", "")
+    except Exception:
+        secrets_passcode = ""
+
+    return env_passcode or secrets_passcode
+
+
 def require_passcode():
     """
     Optional protection.
 
-    Set this before running:
+    Local:
       export WORKLOG_PASSCODE="your-secret"
+
+    Streamlit Cloud:
+      Add WORKLOG_PASSCODE in App Secrets.
 
     If WORKLOG_PASSCODE is not set, the app opens without login.
     """
-    app_passcode = os.environ.get("WORKLOG_PASSCODE")
+    app_passcode = get_app_passcode()
 
     if not app_passcode:
         return True
