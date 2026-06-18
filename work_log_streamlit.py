@@ -3,6 +3,8 @@ import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from streamlit_autorefresh import st_autorefresh
+
 import streamlit as st
 
 
@@ -1005,6 +1007,7 @@ def main():
     )
 
     inject_css()
+    st_autorefresh(interval=1000, key="worklog_autorefresh")
 
     if not require_passcode():
         return
