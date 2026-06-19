@@ -1276,48 +1276,48 @@ def metric_card(title, value, color="#1F2937", bg="#FFFFFF"):
 # Auth UI
 # -----------------------------
 
-def render_auth_debug(controller):
-    with st.expander("Login debug", expanded=True):
-        request_cookie = get_request_cookie(APP_SESSION_COOKIE_NAME)
-        component_cookie = get_component_cookie(controller, APP_SESSION_COOKIE_NAME)
+# def render_auth_debug(controller):
+#     with st.expander("Login debug", expanded=True):
+#         request_cookie = get_request_cookie(APP_SESSION_COOKIE_NAME)
+#         component_cookie = get_component_cookie(controller, APP_SESSION_COOKIE_NAME)
 
-        st.write("Session user exists:", bool(current_user()))
-        st.write("Request cookie exists:", bool(request_cookie))
-        st.write("Component cookie exists:", bool(component_cookie))
+#         st.write("Session user exists:", bool(current_user()))
+#         st.write("Request cookie exists:", bool(request_cookie))
+#         st.write("Component cookie exists:", bool(component_cookie))
 
-        token = request_cookie or component_cookie
+#         token = request_cookie or component_cookie
 
-        if not token:
-            st.error("No browser cookie found.")
-            return
+#         if not token:
+#             st.error("No browser cookie found.")
+#             return
 
-        token_hash = hash_session_token(token)
+#         token_hash = hash_session_token(token)
 
-        result = execute_db(
-            db()
-            .table("app_user_sessions")
-            .select("id, user_id, expires_at, created_at")
-            .eq("token_hash", token_hash)
-            .limit(1),
-            error_message="Could not check login session."
-        )
+#         result = execute_db(
+#             db()
+#             .table("app_user_sessions")
+#             .select("id, user_id, expires_at, created_at")
+#             .eq("token_hash", token_hash)
+#             .limit(1),
+#             error_message="Could not check login session."
+#         )
 
-        if result is None:
-            st.error("Could not query app_user_sessions.")
-            return
+#         if result is None:
+#             st.error("Could not query app_user_sessions.")
+#             return
 
-        if not result.data:
-            st.error("Cookie exists, but Supabase has no matching token_hash.")
-            return
+#         if not result.data:
+#             st.error("Cookie exists, but Supabase has no matching token_hash.")
+#             return
 
-        row = result.data[0]
-        expires_at = parse_datetime(row["expires_at"])
+#         row = result.data[0]
+#         expires_at = parse_datetime(row["expires_at"])
 
-        st.success("Cookie exists and Supabase session matches.")
-        st.write("User ID:", row["user_id"])
-        st.write("Created at:", row["created_at"])
-        st.write("Expires at:", expires_at)
-        st.write("Expired:", expires_at <= now())
+#         st.success("Cookie exists and Supabase session matches.")
+#         st.write("User ID:", row["user_id"])
+#         st.write("Created at:", row["created_at"])
+#         st.write("Expires at:", expires_at)
+#         st.write("Expired:", expires_at <= now())
 
 def render_auth_page(controller):
     st.markdown(
@@ -1335,7 +1335,7 @@ def render_auth_page(controller):
     show_flash()
     show_db_error()
 
-    render_auth_debug(controller)
+    # render_auth_debug(controller)
     
     tab_login, tab_signup = st.tabs(["Login", "Create account"])
 
