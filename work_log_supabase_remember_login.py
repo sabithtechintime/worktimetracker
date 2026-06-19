@@ -754,7 +754,194 @@ def check_out(user_id):
     session_duration = current_time - check_in_time
 
     return True, f"Checked out successfully. Session: {format_duration(session_duration)}"
+# -----------------------------
+# Manual day/session management
+# -----------------------------
 
+def combine_work_date_and_time(work_date, time_value):
+    return datetime.combine(work_date, time_value).replace(tzinfo=APP_TIMEZONE)
+
+
+def session_label(session):
+    check_in_time = parse_datetime(session["check_in"])
+    check_out_value = session.get("check_out")
+
+    if check_out_value:
+        check_out_time = parse_datetime(check_out_value)
+        duration = check_out_time - check_in_time
+        return (
+            f'{format_time(check_in_time)} → '
+            f'{format_time(check_out_time)} '
+            f'({format_duration(duration)})'
+        )
+
+    return f'{format_time(check_in_time)} → Open session'
+
+
+def has_overlapping_session(
+    user_id,
+    work_date,
+    check_in_time,
+    check_out_time,
+    exclude_session_id=None
+):
+    work_date_key = work_date.isoformat()
+    sessions = get_sessions_for_date(user_id, work_date_key)
+
+    for session in sessions:
+        if exclude_session_id and str(session["id"]) == str(exclude_session_id):
+            continue
+
+        existing_check_in = parse_datetime(session["check_in"])
+        existing_check_out_value = session.get("check_out")
+
+        if existing_check_out_value:
+            existing_check_out = parse_datetime(existing_check_out_value)
+        else:
+            existing_check_out = now()
+
+        if check_in_time < existing_check_out and check_out_time > existing_check_in:
+            return True
+
+    return False
+
+
+def validate_manual_session_times(check_in_time, check_out_time):
+    if check_out_time <= check_in_time:
+        return False, "Check-out time must be after check-in time."
+
+    if check_in_time.date() != check_out_time.date():
+        return False, "Check-in and check-out must be on the same date."
+
+    if check_in_time > now():
+        return False, "Check-in time cannot be in the future."
+
+    if check_out_time > now():
+        return False, "Check-out time cannot be in the future."
+
+    return True, ""
+
+
+def add_manual_session(user_id, work_date, check_in_clock, check_out_clock):
+    work_date_key = work_date.isoformat()
+
+    check_in_time = combine_work_date_and_time(work_date, check_in_clock)
+    check_out_time = combine_work_date_and_time(work_date, check_out_clock)
+
+    is_valid, message = validate_manual_session_times(
+        check_in_time,
+        check_out_time
+    )
+
+    if not is_valid:
+        return False, message
+
+    if has_overlapping_session(
+        user_id,
+        work_date,
+        check_in_time,
+        check_out_time
+    ):
+        return False, "This session overlaps with an existing entry for the selected day."
+
+    result = execute_db(
+        db()
+        .table("work_sessions")
+        .insert({
+            "user_id": user_id,
+            "work_date": work_date_key,
+            "check_in": check_in_time.isoformat(),
+            "check_out": check_out_time.isoformat(),
+        }),
+        error_message="Could not add manual session."
+    )
+
+    if result is None:
+        return False, "Could not add manual session due to a database error."
+
+    return True, "Manual session added successfully."
+
+
+def update_manual_session(
+    user_id,
+    session_id,
+    work_date,
+    check_in_clock,
+    check_out_clock
+):
+    work_date_key = work_date.isoformat()
+
+    check_in_time = combine_work_date_and_time(work_date, check_in_clock)
+    check_out_time = combine_work_date_and_time(work_date, check_out_clock)
+
+    is_valid, message = validate_manual_session_times(
+        check_in_time,
+        check_out_time
+    )
+
+    if not is_valid:
+        return False, message
+
+    if has_overlapping_session(
+        user_id,
+        work_date,
+        check_in_time,
+        check_out_time,
+        exclude_session_id=session_id
+    ):
+        return False, "Updated time overlaps with another existing entry for the selected day."
+
+    result = execute_db(
+        db()
+        .table("work_sessions")
+        .update({
+            "work_date": work_date_key,
+            "check_in": check_in_time.isoformat(),
+            "check_out": check_out_time.isoformat(),
+        })
+        .eq("id", session_id)
+        .eq("user_id", user_id),
+        error_message="Could not update session."
+    )
+
+    if result is None:
+        return False, "Could not update session due to a database error."
+
+    return True, "Session updated successfully."
+
+
+def delete_manual_session(user_id, session_id):
+    result = execute_db(
+        db()
+        .table("work_sessions")
+        .delete()
+        .eq("id", session_id)
+        .eq("user_id", user_id),
+        error_message="Could not delete session."
+    )
+
+    if result is None:
+        return False, "Could not delete session due to a database error."
+
+    return True, "Session deleted successfully."
+
+
+def reset_day_sessions(user_id, work_date):
+    work_date_key = work_date.isoformat()
+
+    result = execute_db(
+        db()
+        .table("work_sessions")
+        .delete()
+        .eq("user_id", user_id)
+        .eq("work_date", work_date_key),
+        error_message="Could not reset selected day."
+    )
+
+    if result is None:
+        return False, "Could not reset selected day due to a database error."
+
+    return True, f"All entries for {work_date_key} were deleted."
 
 def calculate_month_summary(user_id, month_value=None, include_today=True):
     if month_value is None:
@@ -1657,6 +1844,187 @@ def render_adjusted_logout(user_id):
             unsafe_allow_html=True
         )
 
+def render_day_management(user_id):
+    st.markdown(
+        """
+        <div class="card-title">Manual Day Management</div>
+        <div class="card-subtitle">
+            Add, edit, delete, or reset work entries for a selected day.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    selected_date = st.date_input(
+        "Select work date",
+        value=now().date(),
+        key="manual_work_date"
+    )
+
+    sessions = get_sessions_for_date(user_id, selected_date.isoformat())
+
+    tab_add, tab_edit, tab_reset = st.tabs([
+        "Add Entry",
+        "Change Entry",
+        "Reset Day"
+    ])
+
+    with tab_add:
+        st.markdown("#### Add work entry")
+
+        with st.form("manual_add_session_form"):
+            col1, col2 = st.columns(2)
+
+            with col1:
+                add_check_in = st.time_input(
+                    "Check-in time",
+                    value=datetime.strptime("09:00", "%H:%M").time(),
+                    key="manual_add_check_in"
+                )
+
+            with col2:
+                add_check_out = st.time_input(
+                    "Check-out time",
+                    value=datetime.strptime("18:00", "%H:%M").time(),
+                    key="manual_add_check_out"
+                )
+
+            submitted = st.form_submit_button(
+                "Add Entry",
+                width="stretch"
+            )
+
+        if submitted:
+            success, message = add_manual_session(
+                user_id=user_id,
+                work_date=selected_date,
+                check_in_clock=add_check_in,
+                check_out_clock=add_check_out
+            )
+
+            set_flash(message, "success" if success else "error")
+            st.rerun()
+
+    with tab_edit:
+        st.markdown("#### Change existing entry")
+
+        if not sessions:
+            st.info("No entries found for the selected day.")
+        else:
+            session_options = {
+                session_label(session): session
+                for session in sessions
+            }
+
+            selected_label = st.selectbox(
+                "Select entry to change",
+                options=list(session_options.keys()),
+                key="manual_edit_session_select"
+            )
+
+            selected_session = session_options[selected_label]
+
+            existing_check_in = parse_datetime(selected_session["check_in"])
+
+            if selected_session.get("check_out"):
+                existing_check_out = parse_datetime(selected_session["check_out"])
+            else:
+                existing_check_out = now()
+
+            with st.form("manual_edit_session_form"):
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    edit_check_in = st.time_input(
+                        "New check-in time",
+                        value=existing_check_in.time(),
+                        key="manual_edit_check_in"
+                    )
+
+                with col2:
+                    edit_check_out = st.time_input(
+                        "New check-out time",
+                        value=existing_check_out.time(),
+                        key="manual_edit_check_out"
+                    )
+
+                update_submitted = st.form_submit_button(
+                    "Update Entry",
+                    width="stretch"
+                )
+
+            if update_submitted:
+                success, message = update_manual_session(
+                    user_id=user_id,
+                    session_id=selected_session["id"],
+                    work_date=selected_date,
+                    check_in_clock=edit_check_in,
+                    check_out_clock=edit_check_out
+                )
+
+                set_flash(message, "success" if success else "error")
+                st.rerun()
+
+            if st.button(
+                "Delete Selected Entry",
+                width="stretch",
+                key="manual_delete_selected_entry"
+            ):
+                success, message = delete_manual_session(
+                    user_id=user_id,
+                    session_id=selected_session["id"]
+                )
+
+                set_flash(message, "success" if success else "error")
+                st.rerun()
+
+    with tab_reset:
+        st.markdown("#### Reset selected day")
+
+        if not sessions:
+            st.info("No entries found for the selected day.")
+        else:
+            rows = []
+
+            for session in sessions:
+                check_in_time = parse_datetime(session["check_in"])
+                check_out_value = session.get("check_out")
+
+                if check_out_value:
+                    check_out_time = parse_datetime(check_out_value)
+                    duration = check_out_time - check_in_time
+                    check_out_text = format_time(check_out_time)
+                    duration_text = format_duration(duration)
+                else:
+                    check_out_text = "Open"
+                    duration_text = "-"
+
+                rows.append({
+                    "Check In": format_time(check_in_time),
+                    "Check Out": check_out_text,
+                    "Duration": duration_text,
+                })
+
+            st.dataframe(rows, width="stretch", hide_index=True)
+
+            confirm_reset = st.checkbox(
+                f"I confirm deleting all entries for {selected_date.isoformat()}",
+                key="manual_confirm_reset_day"
+            )
+
+            if st.button(
+                "Reset This Day",
+                width="stretch",
+                key="manual_reset_day_button",
+                disabled=not confirm_reset
+            ):
+                success, message = reset_day_sessions(
+                    user_id=user_id,
+                    work_date=selected_date
+                )
+
+                set_flash(message, "success" if success else "error")
+                st.rerun()
 
 def render_monthly_report(user_id):
     st.markdown(
@@ -1840,6 +2208,11 @@ def main():
         st.markdown('<div class="card">', unsafe_allow_html=True)
         render_adjusted_logout(user_id)
         st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    render_day_management(user_id)
+    st.markdown('</div>', unsafe_allow_html=True)
+
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
     render_monthly_report(user_id)
