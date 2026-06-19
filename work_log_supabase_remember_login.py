@@ -331,11 +331,12 @@ def restore_login_from_cookie(controller):
     if current_user():
         return
 
+    # Important:
+    # Do not call controller.refresh() here. CookieController.__init__ already
+    # creates a Streamlit custom component with COOKIE_CONTROLLER_KEY on the
+    # first run. Calling refresh() in the same run creates another component
+    # with the same key and raises StreamlitDuplicateElementKey.
     token = controller.get(REMEMBER_COOKIE_NAME)
-
-    if not token:
-        controller.refresh()
-        token = controller.get(REMEMBER_COOKIE_NAME)
 
     if not token:
         return
