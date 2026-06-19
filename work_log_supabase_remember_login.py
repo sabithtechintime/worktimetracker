@@ -15,10 +15,14 @@ TARGET_HOURS = 8
 HALF_DAY_MINIMUM_HOURS = 6
 APP_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
-REMEMBER_COOKIE_NAME = "office_swipe_session"
-REMEMBER_SESSION_DAYS = 30
-REMEMBER_SESSION_MAX_AGE = REMEMBER_SESSION_DAYS * 24 * 60 * 60
+# Daily device login
+# A user who logs in from one browser/device should not need to log in again
+# until the end of the current day in APP_TIMEZONE.
+APP_SESSION_COOKIE_NAME = "office_swipe_daily_session"
 COOKIE_CONTROLLER_KEY = "office_swipe_cookie_controller"
+# Keep False for local/non-HTTPS development. Use True on Streamlit Cloud or HTTPS deployments.
+COOKIE_SECURE = True
+COOKIE_SAME_SITE = "lax"
 
 
 # -----------------------------
@@ -43,6 +47,31 @@ def target_duration():
 
 def half_day_minimum_duration():
     return timedelta(hours=HALF_DAY_MINIMUM_HOURS)
+
+
+def end_of_today():
+    """Return midnight after today in the application timezone."""
+    current = now()
+    tomorrow = current.date() + timedelta(days=1)
+
+    return datetime(
+        year=tomorrow.year,
+        month=tomorrow.month,
+        day=tomorrow.day,
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+        tzinfo=APP_TIMEZONE,
+    )
+
+
+def seconds_until_end_of_today():
+    seconds = int((end_of_today() - now()).total_seconds())
+
+    # Avoid creating an immediately expired cookie if login happens exactly
+    # around midnight. One minute is enough to let the next run cleanly expire.
+    return max(seconds, 60)
 
 
 def parse_datetime(value):
@@ -249,21 +278,45 @@ def show_flash():
 # User auth
 # -----------------------------
 
+
+# -----------------------------
+# Daily device login sessions
+# -----------------------------
+
 def get_cookie_controller():
+    """
+    Create the cookie controller once per Streamlit run.
+
+    Important:
+    - Create this only once per run.
+    - Restore first tries st.context.cookies and then uses controller.get() as a
+      fallback for hosted environments where request cookies are filtered.
+    - Do not call controller.refresh() in the same run as initialization.
+    """
     return CookieController(key=COOKIE_CONTROLLER_KEY)
 
 
-def get_browser_cookie(name):
+def get_request_cookie(name):
     """
-    Read cookies using Streamlit's native request context.
+    Read cookies from Streamlit's native request context.
 
-    This is more reliable than using CookieController.get() during app startup
-    because st.context.cookies is available from the request that opened the app,
-    while custom components can return values only after the frontend component
-    has mounted.
+    This is fast when available. Some hosted Streamlit environments may filter
+    request cookies before they reach st.context, so restore also has a
+    CookieController fallback below.
     """
     try:
         return st.context.cookies.get(name)
+    except Exception:
+        return None
+
+
+def get_component_cookie(controller, name):
+    """Read cookie from the frontend component cache as a fallback."""
+    if controller is None:
+        return None
+
+    try:
+        return controller.get(name)
     except Exception:
         return None
 
@@ -272,7 +325,7 @@ def hash_session_token(token):
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def clear_expired_user_sessions():
+def clear_expired_app_user_sessions():
     execute_db(
         db()
         .table("app_user_sessions")
@@ -282,10 +335,17 @@ def clear_expired_user_sessions():
     )
 
 
-def create_remember_session(user_id, controller):
+def create_daily_device_session(user_id, controller):
+    """
+    Create a one-day remembered login for this browser/device.
+
+    Browser cookie stores the raw random token.
+    Supabase stores only sha256(token), never the raw token.
+    """
     token = secrets.token_urlsafe(32)
     token_hash = hash_session_token(token)
-    expires_at = now() + timedelta(days=REMEMBER_SESSION_DAYS)
+    expires_at = end_of_today()
+    max_age = seconds_until_end_of_today()
 
     created = execute_db(
         db()
@@ -295,31 +355,32 @@ def create_remember_session(user_id, controller):
             "token_hash": token_hash,
             "expires_at": expires_at.isoformat(),
         }),
-        error_message="Could not create remembered login session."
+        error_message="Could not create daily login session."
     )
 
     if created is None:
         return False
 
-    # Keep the token in server session state too so logout can delete the DB row
-    # even before the next browser request exposes the cookie through st.context.
-    st.session_state["remember_session_token"] = token
+    st.session_state["daily_session_token"] = token
 
     controller.set(
-        REMEMBER_COOKIE_NAME,
+        APP_SESSION_COOKIE_NAME,
         token,
-        max_age=REMEMBER_SESSION_MAX_AGE,
-        same_site="lax",
-        secure=False,  # Change to True when the app is served only over HTTPS.
+        expires=expires_at,
+        max_age=max_age,
+        same_site=COOKIE_SAME_SITE,
+        secure=COOKIE_SECURE,
     )
 
     return True
 
 
-def delete_remember_session(controller):
+def delete_daily_device_session(controller=None):
+    """Delete the current browser/device daily session, if one exists."""
     token = (
-        st.session_state.get("remember_session_token")
-        or get_browser_cookie(REMEMBER_COOKIE_NAME)
+        st.session_state.get("daily_session_token")
+        or get_request_cookie(APP_SESSION_COOKIE_NAME)
+        or get_component_cookie(controller, APP_SESSION_COOKIE_NAME)
     )
 
     if token:
@@ -328,16 +389,23 @@ def delete_remember_session(controller):
             .table("app_user_sessions")
             .delete()
             .eq("token_hash", hash_session_token(token)),
-            error_message="Could not delete remembered login session."
+            error_message="Could not delete daily login session."
         )
 
-    st.session_state.pop("remember_session_token", None)
+    st.session_state.pop("daily_session_token", None)
 
-    controller.remove(
-        REMEMBER_COOKIE_NAME,
-        same_site="lax",
-        secure=False,  # Keep this aligned with create_remember_session().
-    )
+    if controller is not None:
+        try:
+            controller.remove(
+                APP_SESSION_COOKIE_NAME,
+                same_site=COOKIE_SAME_SITE,
+                secure=COOKIE_SECURE,
+            )
+        except KeyError:
+            # streamlit-cookies-controller may raise KeyError if its internal
+            # cookie cache did not contain the cookie, even though the browser
+            # removal command was already sent.
+            pass
 
 
 def extract_embedded_user(session_row):
@@ -351,13 +419,21 @@ def extract_embedded_user(session_row):
     return embedded_user
 
 
-def restore_login_from_cookie():
+def restore_login_from_daily_session(controller=None):
+    """
+    Restore st.session_state["user"] from the browser cookie and Supabase.
+
+    This should run once at the start of main(), before checking current_user().
+    It solves the mobile/minimized-browser issue where Streamlit session_state
+    is lost but the browser cookie still exists.
+    """
     if current_user():
         return
 
-    # Read the cookie from Streamlit's native request context.
-    # This avoids relying on a frontend custom component during startup.
-    token = get_browser_cookie(REMEMBER_COOKIE_NAME)
+    token = (
+        get_request_cookie(APP_SESSION_COOKIE_NAME)
+        or get_component_cookie(controller, APP_SESSION_COOKIE_NAME)
+    )
 
     if not token:
         return
@@ -373,13 +449,10 @@ def restore_login_from_cookie():
         )
         .eq("token_hash", token_hash)
         .limit(1),
-        error_message="Could not restore remembered login."
+        error_message="Could not restore daily login session."
     )
 
-    if result is None:
-        return
-
-    if not result.data:
+    if result is None or not result.data:
         return
 
     session_row = result.data[0]
@@ -391,7 +464,7 @@ def restore_login_from_cookie():
             .table("app_user_sessions")
             .delete()
             .eq("id", session_row["id"]),
-            error_message="Could not delete expired remembered login session."
+            error_message="Could not remove expired daily login session."
         )
         return
 
@@ -405,7 +478,7 @@ def restore_login_from_cookie():
         "username": user["username"],
         "display_name": user["display_name"],
     }
-    st.session_state["remember_session_token"] = token
+    st.session_state["daily_session_token"] = token
 
 def create_user(username, display_name, passcode):
     username = username.strip().lower()
@@ -454,7 +527,7 @@ def create_user(username, display_name, passcode):
     return True, "Account created successfully. Please login."
 
 
-def login_user(username, passcode, remember_me=False, controller=None):
+def login_user(username, passcode, remember_for_today=True, controller=None):
     username = username.strip().lower()
 
     result = execute_db(
@@ -487,16 +560,15 @@ def login_user(username, passcode, remember_me=False, controller=None):
         "display_name": user["display_name"],
     }
 
-    if remember_me and controller is not None:
-        clear_expired_user_sessions()
-        create_remember_session(user["id"], controller)
+    if remember_for_today and controller is not None:
+        clear_expired_app_user_sessions()
+        create_daily_device_session(user["id"], controller)
 
     return True, "Logged in successfully."
 
-
 def logout_user(controller=None):
     if controller is not None:
-        delete_remember_session(controller)
+        delete_daily_device_session(controller)
 
     st.session_state.pop("user", None)
     st.session_state.pop("adjusted_result", None)
@@ -1226,37 +1298,21 @@ def render_auth_page(controller):
     with tab_login:
         username = st.text_input("Username", key="login_username")
         passcode = st.text_input("Passcode", type="password", key="login_passcode")
-        remember_me = st.checkbox(
-            "Remember me for 30 days",
+        remember_for_today = st.checkbox(
+            "Keep me logged in for today on this device",
             value=True,
-            key="remember_me"
+            key="remember_for_today"
         )
 
         if st.button("Login", width="stretch"):
             success, message = login_user(
                 username=username,
                 passcode=passcode,
-                remember_me=remember_me,
+                remember_for_today=remember_for_today,
                 controller=controller,
             )
 
             if success:
-                if remember_me:
-                    st.success(message)
-                    st.info(
-                        "Remember login has been saved. "
-                        "Click Continue once to open the dashboard."
-                    )
-
-                    if st.button(
-                        "Continue to dashboard",
-                        width="stretch",
-                        key="continue_after_login"
-                    ):
-                        st.rerun()
-
-                    st.stop()
-
                 set_flash(message, "success")
                 st.rerun()
             else:
@@ -1694,8 +1750,8 @@ def main():
         layout="wide"
     )
 
-    restore_login_from_cookie()
     controller = get_cookie_controller()
+    restore_login_from_daily_session(controller)
 
     inject_css()
 
