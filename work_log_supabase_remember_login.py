@@ -253,6 +253,21 @@ def get_cookie_controller():
     return CookieController(key=COOKIE_CONTROLLER_KEY)
 
 
+def get_browser_cookie(name):
+    """
+    Read cookies using Streamlit's native request context.
+
+    This is more reliable than using CookieController.get() during app startup
+    because st.context.cookies is available from the request that opened the app,
+    while custom components can return values only after the frontend component
+    has mounted.
+    """
+    try:
+        return st.context.cookies.get(name)
+    except Exception:
+        return None
+
+
 def hash_session_token(token):
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -286,11 +301,15 @@ def create_remember_session(user_id, controller):
     if created is None:
         return False
 
+    # Keep the token in server session state too so logout can delete the DB row
+    # even before the next browser request exposes the cookie through st.context.
+    st.session_state["remember_session_token"] = token
+
     controller.set(
         REMEMBER_COOKIE_NAME,
         token,
         max_age=REMEMBER_SESSION_MAX_AGE,
-        same_site="strict",
+        same_site="lax",
         secure=False,  # Change to True when the app is served only over HTTPS.
     )
 
@@ -298,7 +317,10 @@ def create_remember_session(user_id, controller):
 
 
 def delete_remember_session(controller):
-    token = controller.get(REMEMBER_COOKIE_NAME)
+    token = (
+        st.session_state.get("remember_session_token")
+        or get_browser_cookie(REMEMBER_COOKIE_NAME)
+    )
 
     if token:
         execute_db(
@@ -309,11 +331,13 @@ def delete_remember_session(controller):
             error_message="Could not delete remembered login session."
         )
 
-        controller.remove(
-            REMEMBER_COOKIE_NAME,
-            same_site="strict",
-            secure=False,  # Keep this aligned with create_remember_session().
-        )
+    st.session_state.pop("remember_session_token", None)
+
+    controller.remove(
+        REMEMBER_COOKIE_NAME,
+        same_site="lax",
+        secure=False,  # Keep this aligned with create_remember_session().
+    )
 
 
 def extract_embedded_user(session_row):
@@ -327,16 +351,13 @@ def extract_embedded_user(session_row):
     return embedded_user
 
 
-def restore_login_from_cookie(controller):
+def restore_login_from_cookie():
     if current_user():
         return
 
-    # Important:
-    # Do not call controller.refresh() here. CookieController.__init__ already
-    # creates a Streamlit custom component with COOKIE_CONTROLLER_KEY on the
-    # first run. Calling refresh() in the same run creates another component
-    # with the same key and raises StreamlitDuplicateElementKey.
-    token = controller.get(REMEMBER_COOKIE_NAME)
+    # Read the cookie from Streamlit's native request context.
+    # This avoids relying on a frontend custom component during startup.
+    token = get_browser_cookie(REMEMBER_COOKIE_NAME)
 
     if not token:
         return
@@ -359,11 +380,6 @@ def restore_login_from_cookie(controller):
         return
 
     if not result.data:
-        controller.remove(
-            REMEMBER_COOKIE_NAME,
-            same_site="strict",
-            secure=False,
-        )
         return
 
     session_row = result.data[0]
@@ -377,22 +393,11 @@ def restore_login_from_cookie(controller):
             .eq("id", session_row["id"]),
             error_message="Could not delete expired remembered login session."
         )
-
-        controller.remove(
-            REMEMBER_COOKIE_NAME,
-            same_site="strict",
-            secure=False,
-        )
         return
 
     user = extract_embedded_user(session_row)
 
     if not user:
-        controller.remove(
-            REMEMBER_COOKIE_NAME,
-            same_site="strict",
-            secure=False,
-        )
         return
 
     st.session_state["user"] = {
@@ -400,7 +405,7 @@ def restore_login_from_cookie(controller):
         "username": user["username"],
         "display_name": user["display_name"],
     }
-
+    st.session_state["remember_session_token"] = token
 
 def create_user(username, display_name, passcode):
     username = username.strip().lower()
@@ -1236,6 +1241,22 @@ def render_auth_page(controller):
             )
 
             if success:
+                if remember_me:
+                    st.success(message)
+                    st.info(
+                        "Remember login has been saved. "
+                        "Click Continue once to open the dashboard."
+                    )
+
+                    if st.button(
+                        "Continue to dashboard",
+                        width="stretch",
+                        key="continue_after_login"
+                    ):
+                        st.rerun()
+
+                    st.stop()
+
                 set_flash(message, "success")
                 st.rerun()
             else:
@@ -1673,8 +1694,8 @@ def main():
         layout="wide"
     )
 
+    restore_login_from_cookie()
     controller = get_cookie_controller()
-    restore_login_from_cookie(controller)
 
     inject_css()
 
